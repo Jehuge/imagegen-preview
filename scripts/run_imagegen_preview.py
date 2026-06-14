@@ -3,11 +3,14 @@ from __future__ import annotations
 
 import argparse
 import base64
+import http.client
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -35,11 +38,12 @@ KNOWN_SIZES = {
 }
 
 CHINESE_ONLY_INSTRUCTION = (
-    "画面中的叙述性文字和版式标签优先使用简体中文。"
-    "不要出现乱码、随机字母或无意义伪文字。"
-    "如果源内容明确要求保留英文缩写、模型名、编号、代码标识或单位，例如 API、AI、TrafficVLM、G40、CSV、km/h，请按源文本保留。"
-    "其他非源内容的英文说明尽量改写为简体中文。"
-    "文字标签要短，字号要大，清晰可读。"
+    "\u753b\u9762\u4e2d\u7684\u53d9\u8ff0\u6027\u6587\u5b57\u548c\u7248\u5f0f\u6807\u7b7e\u4f18\u5148\u4f7f\u7528\u7b80\u4f53\u4e2d\u6587\u3002"
+    "\u4e0d\u8981\u51fa\u73b0\u4e71\u7801\u3001\u968f\u673a\u5b57\u6bcd\u6216\u65e0\u610f\u4e49\u4f2a\u6587\u5b57\u3002"
+    "\u5982\u679c\u6e90\u5185\u5bb9\u660e\u786e\u8981\u6c42\u4fdd\u7559\u82f1\u6587\u7f29\u5199\u3001\u6a21\u578b\u540d\u3001\u7f16\u53f7\u3001\u4ee3\u7801\u6807\u8bc6\u6216\u5355\u4f4d\uff0c"
+    "\u4f8b\u5982 API\u3001AI\u3001TrafficVLM\u3001G40\u3001CSV\u3001km/h\uff0c\u8bf7\u6309\u6e90\u6587\u672c\u4fdd\u7559\u3002"
+    "\u5176\u4ed6\u975e\u6e90\u5185\u5bb9\u7684\u82f1\u6587\u8bf4\u660e\u5c3d\u91cf\u6539\u5199\u4e3a\u7b80\u4f53\u4e2d\u6587\u3002"
+    "\u6587\u5b57\u6807\u7b7e\u8981\u77ed\uff0c\u5b57\u53f7\u8981\u5927\uff0c\u6e05\u6670\u53ef\u8bfb\u3002"
 )
 
 
@@ -162,6 +166,10 @@ def response_preview(text: str, limit: int = 1200) -> str:
     return text[:limit].replace("\r", "\\r").replace("\n", "\\n")
 
 
+def transient_error_message(exc: BaseException) -> str:
+    return f"{exc.__class__.__name__}: {exc}"
+
+
 def fetch_url(url: str, timeout: int) -> bytes:
     with urllib.request.urlopen(url, timeout=timeout) as response:
         return response.read()
@@ -244,6 +252,64 @@ def print_safe_config(config: dict[str, str], out_path: Path, transport: str) ->
         print("Warning: multiple API key entries found; using the last one.")
 
 
+def open_url_with_retries(
+    endpoint: str,
+    request_data: bytes,
+    headers: dict[str, str],
+    timeout: int,
+    retries: int,
+    retry_delay: float,
+) -> str:
+    attempts = retries + 1
+    retryable_http = {408, 409, 425, 429, 500, 502, 503, 504}
+    transient_errors = (
+        TimeoutError,
+        socket.timeout,
+        ConnectionResetError,
+        http.client.RemoteDisconnected,
+        http.client.IncompleteRead,
+        urllib.error.URLError,
+    )
+
+    for attempt in range(1, attempts + 1):
+        if attempts > 1:
+            print(f"HTTP attempt {attempt}/{attempts}; timeout={timeout}s")
+        request = urllib.request.Request(
+            endpoint,
+            data=request_data,
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            text = exc.read().decode("utf-8", errors="replace")
+            if exc.code in retryable_http and attempt < attempts:
+                print(
+                    f"Image API HTTP {exc.code}; retrying in {retry_delay}s: "
+                    f"{response_preview(text, 300)}"
+                )
+                time.sleep(retry_delay)
+                continue
+            raise SystemExit(f"Image API HTTP {exc.code}: {response_preview(text)}")
+        except transient_errors as exc:
+            if attempt < attempts:
+                print(
+                    f"Image API connection failed; retrying in {retry_delay}s: "
+                    f"{transient_error_message(exc)}"
+                )
+                time.sleep(retry_delay)
+                continue
+            raise SystemExit(
+                "Image API connection failed after "
+                f"{attempts} attempt(s), timeout={timeout}s: "
+                f"{transient_error_message(exc)}"
+            )
+
+    raise SystemExit("Image API request failed unexpectedly.")
+
+
 def generate_http(
     args: argparse.Namespace,
     config: dict[str, str],
@@ -253,34 +319,39 @@ def generate_http(
     endpoint = config["base_url"].rstrip("/") + "/images/generations"
     payload = build_http_payload(args, config, fmt)
     print_safe_config(config, out_path, "http")
+    print(f"HTTP timeout: {args.timeout}s")
+    print(f"Retries: {args.retries}")
     if args.dry_run:
         print(
             json.dumps(
-                {"endpoint": endpoint, "payload": payload, "output": str(out_path)},
+                {
+                    "endpoint": endpoint,
+                    "payload": payload,
+                    "output": str(out_path),
+                    "timeout_seconds": args.timeout,
+                    "retries": args.retries,
+                    "retry_delay_seconds": args.retry_delay,
+                },
                 indent=2,
                 ensure_ascii=False,
             )
         )
         return 0
 
-    request = urllib.request.Request(
+    request_data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    headers = {
+        "Accept": "application/json",
+        "Authorization": "Bearer " + config["api_key"],
+        "Content-Type": "application/json",
+    }
+    body = open_url_with_retries(
         endpoint,
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={
-            "Accept": "application/json",
-            "Authorization": "Bearer " + config["api_key"],
-            "Content-Type": "application/json",
-        },
-        method="POST",
+        request_data,
+        headers,
+        args.timeout,
+        args.retries,
+        args.retry_delay,
     )
-    try:
-        with urllib.request.urlopen(request, timeout=args.timeout) as response:
-            body = response.read().decode("utf-8")
-    except urllib.error.HTTPError as exc:
-        text = exc.read().decode("utf-8", errors="replace")
-        raise SystemExit(f"Image API HTTP {exc.code}: {response_preview(text)}")
-    except urllib.error.URLError as exc:
-        raise SystemExit(f"Image API connection failed: {exc}")
 
     try:
         data = json.loads(body)
@@ -307,6 +378,8 @@ def generate_http(
                 "quality": args.quality,
                 "format": fmt,
                 "transport": "http",
+                "timeout_seconds": args.timeout,
+                "retries": args.retries,
             },
             ensure_ascii=False,
         )
@@ -386,7 +459,7 @@ def main() -> int:
     parser.add_argument(
         "--size",
         default="auto",
-        help="Image size, for example auto, 1024x1024, or 2048x1152.",
+        help="Image size, for example auto, 1024x1024, or 3840x2160.",
     )
     parser.add_argument("--quality", default="low", choices=sorted(QUALITY_VALUES), help="Image quality.")
     parser.add_argument(
@@ -401,6 +474,21 @@ def main() -> int:
         help="Number of images to request. This wrapper saves the first image.",
     )
     parser.add_argument("--timeout", type=int, default=300, help="HTTP timeout in seconds.")
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=0,
+        help=(
+            "Retry transient HTTP disconnects or timeout-like failures this many times. "
+            "Use with care because a disconnected upstream may still process the first request."
+        ),
+    )
+    parser.add_argument(
+        "--retry-delay",
+        type=float,
+        default=5.0,
+        help="Seconds to wait before a transient retry.",
+    )
     parser.add_argument(
         "--transport",
         choices=("auto", "http", "cli"),
@@ -418,6 +506,12 @@ def main() -> int:
 
     if not (1 <= args.n <= 10):
         raise SystemExit("--n must be between 1 and 10.")
+    if args.timeout < 1:
+        raise SystemExit("--timeout must be >= 1.")
+    if args.retries < 0:
+        raise SystemExit("--retries must be >= 0.")
+    if args.retry_delay < 0:
+        raise SystemExit("--retry-delay must be >= 0.")
     validate_size(args.size)
 
     workspace = Path.cwd()

@@ -52,6 +52,21 @@ python $HOME\.codex\skills\imagegen-preview\scripts\run_imagegen_preview.py `
   --format png
 ```
 
+4K/high requests can take longer. The HTTP wrapper defaults to a 300-second timeout and supports transient retries:
+
+```powershell
+python $HOME\.codex\skills\imagegen-preview\scripts\run_imagegen_preview.py `
+  --env .env `
+  --transport http `
+  --prompt "Cinematic 4K 16:9 futuristic city skyline with flying cars, no text" `
+  --out future-city-flying-cars-4k.png `
+  --size 3840x2160 `
+  --quality high `
+  --format png `
+  --timeout 300 `
+  --retries 1
+```
+
 ## Files
 
 - `SKILL.md`: Codex skill instructions.
