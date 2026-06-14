@@ -48,6 +48,14 @@ CHINESE_ONLY_INSTRUCTION = (
     "\u6587\u5b57\u6807\u7b7e\u8981\u77ed\uff0c\u5b57\u53f7\u8981\u5927\uff0c\u6e05\u6670\u53ef\u8bfb\u3002"
 )
 
+EDGE_TO_EDGE_INSTRUCTION = (
+    "Fill the entire image canvas edge-to-edge with the actual scene. "
+    "Do not add decorative frames, poster borders, white or gray top/bottom bars, "
+    "letterboxing, pillarboxing, blank margins, slide canvases, screenshot containers, "
+    "rounded presentation mats, gallery mockup backgrounds, or any visible border around the scene. "
+    "If negative space is useful, keep it inside the scene itself rather than as an external margin."
+)
+
 
 def parse_dotenv_value(raw_value: str) -> str:
     value = raw_value.strip()
@@ -231,9 +239,7 @@ def extract_image_bytes(data: Any, timeout: int) -> bytes:
 
 
 def build_http_payload(args: argparse.Namespace, config: dict[str, str], fmt: str) -> dict[str, Any]:
-    prompt = args.prompt
-    if args.chinese_only:
-        prompt = f"{prompt}\n\n{CHINESE_ONLY_INSTRUCTION}"
+    prompt = build_prompt(args)
     return {
         "model": config["image_model"],
         "prompt": prompt,
@@ -242,6 +248,17 @@ def build_http_payload(args: argparse.Namespace, config: dict[str, str], fmt: st
         "quality": args.quality,
         "format": fmt,
     }
+
+
+def build_prompt(args: argparse.Namespace) -> str:
+    additions: list[str] = []
+    if args.chinese_only:
+        additions.append(CHINESE_ONLY_INSTRUCTION)
+    if not args.allow_frame:
+        additions.append(EDGE_TO_EDGE_INSTRUCTION)
+    if not additions:
+        return args.prompt
+    return args.prompt + "\n\n" + "\n".join(additions)
 
 
 def print_safe_config(config: dict[str, str], out_path: Path, transport: str) -> None:
@@ -313,6 +330,7 @@ def write_run_log(
         "output": str(out_path),
         "bytes": byte_count,
         "prompt_chars": len(args.prompt),
+        "allow_frame": args.allow_frame,
         "error": error,
     }
     with log_path.open("a", encoding="utf-8") as handle:
@@ -401,6 +419,7 @@ def generate_http(
                     "retries": args.retries,
                     "retry_delay_seconds": args.retry_delay,
                     "paid_retry_acknowledged": args.allow_paid_retry,
+                    "allow_frame": args.allow_frame,
                     "log_file": None if args.no_log else str(Path(args.log_file) if args.log_file else default_log_path()),
                 },
                 indent=2,
@@ -502,6 +521,7 @@ def generate_http(
                 "transport": "http",
                 "timeout_seconds": args.timeout,
                 "retries": args.retries,
+                "allow_frame": args.allow_frame,
             },
             ensure_ascii=False,
         )
@@ -531,9 +551,7 @@ def generate_cli(
     child_env["OPENAI_BASE_URL"] = config["base_url"]
     child_env["OPENAI_API_KEY"] = config["api_key"]
 
-    prompt = args.prompt
-    if args.chinese_only:
-        prompt = f"{prompt}\n\n{CHINESE_ONLY_INSTRUCTION}"
+    prompt = build_prompt(args)
 
     command = [
         sys.executable,
@@ -622,6 +640,14 @@ def main() -> int:
         help="Safe JSONL run log path. Defaults to .imagegen-preview-runs.jsonl in the workspace.",
     )
     parser.add_argument("--no-log", action="store_true", help="Disable the safe JSONL run log.")
+    parser.add_argument(
+        "--allow-frame",
+        action="store_true",
+        help=(
+            "Allow decorative frames, letterboxing, top/bottom bars, or presentation mats. "
+            "Default is edge-to-edge scene output."
+        ),
+    )
     parser.add_argument(
         "--transport",
         choices=("auto", "http", "cli"),

@@ -45,7 +45,7 @@ Accepted aliases:
 Rules:
 
 - Never print `API_KEY` or the full config file.
-- Check safe fields only: base URL host, whether the API key is configured, model, output path, transport, timeout, retry count, and duplicate-key warnings.
+- Check safe fields only: base URL host, whether the API key is configured, model, output path, transport, timeout, retry count, frame allowance, and duplicate-key warnings.
 - Store only the token in `API_KEY`; do not include the `Bearer ` prefix.
 - Ensure `.env`, `.env.*`, and `.imagegen-preview-runs.jsonl` are ignored while `.env.sample` remains tracked.
 - If duplicate API key lines exist, the script uses the last one and prints a warning without exposing values.
@@ -63,15 +63,27 @@ Image APIs can charge even when the client connection is closed before the image
 
 1. Confirm the request needs the configured API/model path rather than built-in `image_gen`.
 2. Use `scripts/run_imagegen_preview.py`.
-3. Start with `--dry-run` to verify payload, transport, timeout, retry count, paid-retry acknowledgement, log path, and output path.
+3. Start with `--dry-run` to verify payload, transport, timeout, retry count, paid-retry acknowledgement, frame allowance, log path, and output path.
 4. Generate with stable settings first:
    - PPT/slide supporting images: prefer `--size 2048x1152 --quality medium --format png`.
    - 4K landscape: prefer `--size 3840x2160 --quality low --format png`.
    - Use `--timeout 300` for 2K/4K jobs.
    - Use `--quality high` only when the user explicitly asks for it.
    - For yunwu `gpt-image-2`, `quality=high` has been observed to disconnect after billing at both `2048x1152` and `3840x2160`. Try it once without retries; if it disconnects, explain the risk before any further paid attempt.
-5. Inspect the generated file with `view_image` or Pillow before reporting success.
-6. Report final path, model, size, quality, format, transport, timeout, retry count, and whether a paid retry was allowed.
+5. Prompt PPT supporting images as edge-to-edge scene images by default. Do not ask for external margins, poster borders, slide canvases, frame mats, top/bottom bars, letterboxing, or screenshot containers unless the user explicitly wants that style.
+6. If the prompt needs breathing room, ask for "usable negative space inside the scene" rather than "clean margins" or "white space around the image".
+7. Inspect the generated file with `view_image` or Pillow before reporting success. Reject and regenerate if the image has unintended top/bottom borders, outer frames, letterboxing, or a picture-in-picture presentation mat.
+8. Report final path, model, size, quality, format, transport, timeout, retry count, and whether a paid retry was allowed.
+
+## Composition Guardrails
+
+The wrapper appends an edge-to-edge instruction by default:
+
+- Fill the entire canvas with the actual scene.
+- Avoid decorative frames, poster borders, white/gray top or bottom bars, letterboxing, pillarboxing, blank margins, slide canvases, screenshot containers, rounded presentation mats, and visible outer borders.
+- Use internal scene composition for negative space, not external blank bands.
+
+Use `--allow-frame` only when the user explicitly asks for a framed poster, bordered mockup, slide canvas, UI screenshot container, gallery wall, or similar composed presentation format.
 
 ## Yunwu gpt-image-2 Notes
 
@@ -135,6 +147,21 @@ python $HOME\.codex\skills\imagegen-preview\scripts\run_imagegen_preview.py `
   --quality high `
   --format png `
   --timeout 300
+```
+
+Framed/presentation-mat style only when explicitly requested:
+
+```powershell
+python $HOME\.codex\skills\imagegen-preview\scripts\run_imagegen_preview.py `
+  --env .env `
+  --transport http `
+  --prompt "A framed poster mockup on a gallery wall, with visible white mat border" `
+  --out framed-poster.png `
+  --size 2048x1152 `
+  --quality medium `
+  --format png `
+  --timeout 300 `
+  --allow-frame
 ```
 
 Paid retry only after explicit user acceptance:

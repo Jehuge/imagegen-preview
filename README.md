@@ -70,6 +70,8 @@ python $HOME\.codex\skills\imagegen-preview\scripts\run_imagegen_preview.py `
 
 Live retries require `--allow-paid-retry`.
 
+The wrapper also defaults to edge-to-edge scene output. It appends a guard against poster borders, top/bottom bars, letterboxing, slide canvases, and presentation mats. Use `--allow-frame` only when you explicitly want a framed or bordered composition.
+
 ## Files
 
 - `SKILL.md`: Codex skill instructions.
