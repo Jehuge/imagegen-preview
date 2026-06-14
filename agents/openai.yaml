@@ -1,0 +1,4 @@
+interface:
+  display_name: "Imagegen Preview"
+  short_description: "Generate images through a configured .env image API."
+  default_prompt: "Use imagegen-preview to generate an image with the configured third-party image endpoint."
