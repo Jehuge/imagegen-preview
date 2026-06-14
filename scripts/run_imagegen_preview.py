@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import datetime
 import http.client
 import json
 import os
@@ -12,6 +13,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -113,7 +115,7 @@ def ensure_gitignore(workspace: Path) -> None:
     gitignore = workspace / ".gitignore"
     existing = gitignore.read_text(encoding="utf-8") if gitignore.exists() else ""
     lines = {line.strip() for line in existing.splitlines()}
-    wanted = [".env", ".env.*", "!.env.sample"]
+    wanted = [".env", ".env.*", "!.env.sample", ".imagegen-preview-runs.jsonl"]
     missing = [line for line in wanted if line not in lines]
     if not missing:
         return
@@ -252,6 +254,71 @@ def print_safe_config(config: dict[str, str], out_path: Path, transport: str) ->
         print("Warning: multiple API key entries found; using the last one.")
 
 
+def risk_warnings(args: argparse.Namespace, config: dict[str, str], transport: str) -> list[str]:
+    warnings: list[str] = []
+    host = urllib.parse.urlparse(config["base_url"]).netloc.lower()
+    model = config["image_model"].lower()
+    if transport == "http" and "yunwu.ai" in host and model == "gpt-image-2" and args.quality == "high":
+        warnings.append(
+            "yunwu.ai gpt-image-2 quality=high has been observed to disconnect after billing; "
+            "prefer quality=medium for reliable paid runs."
+        )
+    if args.retries > 0:
+        warnings.append(
+            "HTTP retries may create additional paid image requests if the upstream processed "
+            "a disconnected attempt."
+        )
+    return warnings
+
+
+def default_log_path() -> Path:
+    return Path.cwd() / ".imagegen-preview-runs.jsonl"
+
+
+def write_run_log(
+    args: argparse.Namespace,
+    config: dict[str, str],
+    out_path: Path,
+    fmt: str,
+    endpoint: str,
+    status: str,
+    elapsed_seconds: float,
+    attempts: int,
+    *,
+    error: str | None = None,
+    byte_count: int | None = None,
+) -> None:
+    if args.no_log:
+        return
+    log_path = Path(args.log_file) if args.log_file else default_log_path()
+    if not log_path.is_absolute():
+        log_path = Path.cwd() / log_path
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    parsed = urllib.parse.urlparse(config["base_url"])
+    entry = {
+        "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+        "status": status,
+        "transport": "http",
+        "provider_host": parsed.netloc,
+        "endpoint_path": urllib.parse.urlparse(endpoint).path,
+        "model": config["image_model"],
+        "size": args.size,
+        "quality": args.quality,
+        "format": fmt,
+        "n": args.n,
+        "timeout_seconds": args.timeout,
+        "retries": args.retries,
+        "attempts": attempts,
+        "elapsed_seconds": round(elapsed_seconds, 3),
+        "output": str(out_path),
+        "bytes": byte_count,
+        "prompt_chars": len(args.prompt),
+        "error": error,
+    }
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
 def open_url_with_retries(
     endpoint: str,
     request_data: bytes,
@@ -259,7 +326,7 @@ def open_url_with_retries(
     timeout: int,
     retries: int,
     retry_delay: float,
-) -> str:
+) -> tuple[str, int]:
     attempts = retries + 1
     retryable_http = {408, 409, 425, 429, 500, 502, 503, 504}
     transient_errors = (
@@ -282,7 +349,7 @@ def open_url_with_retries(
         )
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
-                return response.read().decode("utf-8")
+                return response.read().decode("utf-8"), attempt
         except urllib.error.HTTPError as exc:
             text = exc.read().decode("utf-8", errors="replace")
             if exc.code in retryable_http and attempt < attempts:
@@ -321,6 +388,8 @@ def generate_http(
     print_safe_config(config, out_path, "http")
     print(f"HTTP timeout: {args.timeout}s")
     print(f"Retries: {args.retries}")
+    for warning in risk_warnings(args, config, "http"):
+        print(f"Warning: {warning}")
     if args.dry_run:
         print(
             json.dumps(
@@ -331,6 +400,8 @@ def generate_http(
                     "timeout_seconds": args.timeout,
                     "retries": args.retries,
                     "retry_delay_seconds": args.retry_delay,
+                    "paid_retry_acknowledged": args.allow_paid_retry,
+                    "log_file": None if args.no_log else str(Path(args.log_file) if args.log_file else default_log_path()),
                 },
                 indent=2,
                 ensure_ascii=False,
@@ -344,29 +415,80 @@ def generate_http(
         "Authorization": "Bearer " + config["api_key"],
         "Content-Type": "application/json",
     }
-    body = open_url_with_retries(
-        endpoint,
-        request_data,
-        headers,
-        args.timeout,
-        args.retries,
-        args.retry_delay,
-    )
+    started = time.monotonic()
+    attempts_used = args.retries + 1
+    try:
+        body, attempts_used = open_url_with_retries(
+            endpoint,
+            request_data,
+            headers,
+            args.timeout,
+            args.retries,
+            args.retry_delay,
+        )
+    except SystemExit as exc:
+        write_run_log(
+            args,
+            config,
+            out_path,
+            fmt,
+            endpoint,
+            "failed",
+            time.monotonic() - started,
+            attempts_used,
+            error=str(exc),
+        )
+        raise
 
     try:
         data = json.loads(body)
-    except json.JSONDecodeError:
-        raise SystemExit(f"Image API returned non-JSON response: {response_preview(body)}")
+    except json.JSONDecodeError as exc:
+        message = f"Image API returned non-JSON response: {response_preview(body)}"
+        write_run_log(
+            args,
+            config,
+            out_path,
+            fmt,
+            endpoint,
+            "failed",
+            time.monotonic() - started,
+            attempts_used,
+            error=f"{exc.__class__.__name__}: {message}",
+        )
+        raise SystemExit(message)
 
     try:
         image_bytes = extract_image_bytes(data, args.timeout)
     except Exception as exc:
+        message = f"Could not extract image from response: {exc}; preview={response_preview(body)}"
+        write_run_log(
+            args,
+            config,
+            out_path,
+            fmt,
+            endpoint,
+            "failed",
+            time.monotonic() - started,
+            attempts_used,
+            error=message,
+        )
         raise SystemExit(
-            f"Could not extract image from response: {exc}; preview={response_preview(body)}"
+            message
         )
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_bytes(image_bytes)
+    write_run_log(
+        args,
+        config,
+        out_path,
+        fmt,
+        endpoint,
+        "success",
+        time.monotonic() - started,
+        attempts_used,
+        byte_count=len(image_bytes),
+    )
     print(
         json.dumps(
             {
@@ -490,6 +612,17 @@ def main() -> int:
         help="Seconds to wait before a transient retry.",
     )
     parser.add_argument(
+        "--allow-paid-retry",
+        action="store_true",
+        help="Allow live retries that may create additional paid upstream image requests.",
+    )
+    parser.add_argument(
+        "--log-file",
+        default=None,
+        help="Safe JSONL run log path. Defaults to .imagegen-preview-runs.jsonl in the workspace.",
+    )
+    parser.add_argument("--no-log", action="store_true", help="Disable the safe JSONL run log.")
+    parser.add_argument(
         "--transport",
         choices=("auto", "http", "cli"),
         default="auto",
@@ -512,6 +645,11 @@ def main() -> int:
         raise SystemExit("--retries must be >= 0.")
     if args.retry_delay < 0:
         raise SystemExit("--retry-delay must be >= 0.")
+    if args.retries > 0 and not args.dry_run and not args.allow_paid_retry:
+        raise SystemExit(
+            "--retries can create additional paid image requests when the upstream disconnects "
+            "after processing. Re-run with --allow-paid-retry only if the user accepts that risk."
+        )
     validate_size(args.size)
 
     workspace = Path.cwd()

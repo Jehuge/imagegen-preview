@@ -52,7 +52,9 @@ python $HOME\.codex\skills\imagegen-preview\scripts\run_imagegen_preview.py `
   --format png
 ```
 
-4K/high requests can take longer. The HTTP wrapper defaults to a 300-second timeout and supports transient retries:
+2K/4K requests can take longer. The HTTP wrapper defaults to a 300-second timeout.
+
+For yunwu `gpt-image-2`, `quality=high` may disconnect after the provider has processed or billed the request. Retry only when you explicitly accept that a second paid request may be created:
 
 ```powershell
 python $HOME\.codex\skills\imagegen-preview\scripts\run_imagegen_preview.py `
@@ -60,12 +62,13 @@ python $HOME\.codex\skills\imagegen-preview\scripts\run_imagegen_preview.py `
   --transport http `
   --prompt "Cinematic 4K 16:9 futuristic city skyline with flying cars, no text" `
   --out future-city-flying-cars-4k.png `
-  --size 3840x2160 `
-  --quality high `
+  --size 2048x1152 `
+  --quality medium `
   --format png `
-  --timeout 300 `
-  --retries 1
+  --timeout 300
 ```
+
+Live retries require `--allow-paid-retry`.
 
 ## Files
 
